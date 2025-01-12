@@ -1,0 +1,6 @@
+{
+    "require": {
+        "padaliyajay/php-autoprefixer": "^1.4",
+        "sabberworm/php-css-parser": "^8.4"
+    }
+}

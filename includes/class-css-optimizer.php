@@ -11,6 +11,12 @@ require_once plugin_dir_path(__FILE__) . 'class-css-processor.php';
 require_once plugin_dir_path(__FILE__) . 'class-css-settings.php';
 require_once plugin_dir_path(__FILE__) . 'class-custom-css-manager.php';
 
+
+// Autoload Composer dependencies
+if (file_exists(dirname(__FILE__) . '/vendor/autoload.php')) {
+    require_once dirname(__FILE__) . '/vendor/autoload.php';
+}
+
 class CSSOptimizer {
     private $options;
     private $cache_dir;

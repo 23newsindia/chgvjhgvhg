@@ -11,52 +11,58 @@ class CSSProcessor {
     private $options;
     private $used_selectors;
     private $is_mobile;
+    private $table_name;
     
     public function __construct($options) {
+        global $wpdb;
         $this->options = $options;
         $this->used_selectors = [];
         $this->is_mobile = wp_is_mobile();
+        $this->table_name = $wpdb->prefix . 'css_optimizer';
     }
 
     public function process_styles() {
-    global $wp_styles;
+    global $wp_styles, $wpdb;
+    
     if (!is_object($wp_styles)) {
         return;
     }
 
-    // Get memory limits
-    $memory_limit = ini_get('memory_limit');
-    $memory_limit_bytes = wp_convert_hr_to_bytes($memory_limit);
-    $safe_limit = $memory_limit_bytes * 0.8; // Use 80% of available memory as safe limit
+    // Set a reasonable memory limit for processing
+    $current_limit = ini_get('memory_limit');
+    if ((int)$current_limit < 256) {
+        ini_set('memory_limit', '256M');
+    }
 
-    // Store original queue
-    $queue = $wp_styles->queue;
+    // Get current page URL
+    $current_url = $this->get_current_page_url();
     
-    // Process in smaller batches
+    // Check if we have cached CSS that's less than 24 hours old
+    $cached_css = $wpdb->get_var($wpdb->prepare(
+        "SELECT css_content FROM {$this->table_name} 
+         WHERE page_url = %s 
+         AND last_updated > DATE_SUB(NOW(), INTERVAL 24 HOUR)",
+        $current_url
+    ));
+
+    if ($cached_css) {
+        $this->output_optimized_css($cached_css);
+        return;
+    }
+
+    // Process CSS if not cached
+    $optimized_css = '';
     $batch_size = 5; // Process 5 styles at a time
-    $batches = array_chunk($queue, $batch_size);
-    
-    foreach ($batches as $batch) {
-        // Check memory before processing batch
-        if (memory_get_usage(true) > $safe_limit) {
-            error_log('CSS Optimizer: Memory limit approaching, stopping processing');
+    $processed = 0;
+
+    foreach (array_chunk($wp_styles->queue, $batch_size) as $batch) {
+        if ($this->is_memory_exhausted(0.8)) { // Check if memory usage is above 80%
+            error_log('CSS Optimizer: Memory limit approaching, using cached CSS');
             break;
         }
 
-        // Collect HTML content for this batch only
-        ob_start();
-        wp_head();
-        wp_footer();
-        $content = ob_get_clean();
-
         foreach ($batch as $handle) {
             if (!$this->should_process_style($handle, $wp_styles)) {
-                continue;
-            }
-
-            // Check memory before processing each style
-            if (memory_get_usage(true) > $safe_limit) {
-                error_log('CSS Optimizer: Memory limit approaching, skipping style: ' . $handle);
                 continue;
             }
 
@@ -65,120 +71,182 @@ class CSSProcessor {
                 continue;
             }
 
-            // Process the style
-            $optimized_css = $this->analyze_and_optimize_css($css_content, $content);
+            // Process in smaller chunks
+            $optimized_chunk = $this->analyze_and_optimize_css($css_content, $this->get_page_html());
+            $optimized_css .= $optimized_chunk;
             
-            if (!empty($optimized_css)) {
-                wp_deregister_style($handle);
-                wp_register_style($handle . '-optimized', false);
-                wp_enqueue_style($handle . '-optimized');
-                wp_add_inline_style($handle . '-optimized', $optimized_css);
-            }
-
-            // Clean up memory
+            // Clean up memory after each style
             unset($css_content);
-            unset($optimized_css);
+            unset($optimized_chunk);
             if (function_exists('gc_collect_cycles')) {
                 gc_collect_cycles();
             }
-        }
-
-        // Clean up batch memory
-        unset($content);
-        if (function_exists('gc_collect_cycles')) {
-            gc_collect_cycles();
+            
+            $processed++;
         }
     }
-}
 
-// Add this helper function if not already defined
-private function wp_convert_hr_to_bytes($size) {
-    $size = trim($size);
-    $unit = strtolower(substr($size, -1));
-    $size = (int)$size;
-    
-    switch ($unit) {
-        case 'g':
-            $size *= 1024;
-        case 'm':
-            $size *= 1024;
-        case 'k':
-            $size *= 1024;
-    }
-    
-    return $size;
-}
-
-  
-  
-  
-  private function analyze_and_optimize_css($css, $html_content) {
-    // Limit the size of CSS to process
-    if (strlen($css) > 1000000) { // 1MB limit
-        error_log('CSS Optimizer: CSS file too large, skipping optimization');
-        return $css;
-    }
-
-    // Parse CSS into rules
-    preg_match_all('/([^{]+)\{([^}]+)\}/s', $css, $matches);
-    
-    $optimized = '';
-    if (!empty($matches[0])) {
-        // Process rules in smaller chunks
-        $chunk_size = 100; // Process 100 rules at a time
-        $total_rules = count($matches[0]);
+    // Only store in database if we processed some styles
+    if ($processed > 0 && !empty($optimized_css)) {
+        // Delete old entries for this URL to prevent table bloat
+        $wpdb->delete($this->table_name, ['page_url' => $current_url]);
         
-        for ($i = 0; $i < $total_rules; $i += $chunk_size) {
-            $chunk = array_slice($matches[0], $i, $chunk_size);
-            $selectors_chunk = array_slice($matches[1], $i, $chunk_size);
-            $properties_chunk = array_slice($matches[2], $i, $chunk_size);
-            
-            foreach ($chunk as $j => $rule) {
-                $selectors = $selectors_chunk[$j];
-                $properties = $properties_chunk[$j];
-                
-                // Skip if it's a media query
-                if (strpos($selectors, '@media') === 0) {
-                    if ($this->options['preserve_media_queries']) {
-                        $optimized .= $rule;
-                    }
-                    continue;
-                }
-                
-                // Process selectors
-                $selector_array = array_map('trim', explode(',', $selectors));
-                $keep_rule = false;
-                
-                foreach ($selector_array as $selector) {
-                    if ($this->is_excluded_selector($selector) || 
-                        $this->is_selector_used($selector, $html_content)) {
-                        $keep_rule = true;
-                        break;
-                    }
-                }
-                
-                if ($keep_rule) {
-                    $optimized .= trim($selectors) . '{' . $properties . '}';
-                }
-            }
-            
-            // Clean up chunk memory
-            unset($chunk);
-            unset($selectors_chunk);
-            unset($properties_chunk);
-            if (function_exists('gc_collect_cycles')) {
-                gc_collect_cycles();
-            }
-        }
+        // Insert new optimized CSS
+        $wpdb->insert(
+            $this->table_name,
+            array(
+                'page_url' => $current_url,
+                'css_content' => $optimized_css,
+                'last_updated' => current_time('mysql')
+            ),
+            array('%s', '%s', '%s')
+        );
     }
-    
-    return $this->minify_css($optimized);
+
+    // Output the optimized CSS
+    $this->output_optimized_css($optimized_css);
 }
 
   
+  private function cleanup_old_cache() {
+    global $wpdb;
+    
+    // Remove entries older than 24 hours
+    $wpdb->query(
+        "DELETE FROM {$this->table_name} 
+         WHERE last_updated < DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+    );
+}
+
   
-  
-  private function is_selector_used($selector, $html_content) {
+
+    private function output_optimized_css($css) {
+        if (!empty($css)) {
+            echo "\n<!-- CSS Optimizer Output -->\n";
+            echo "<style type='text/css'>\n";
+            echo $css;
+            echo "\n</style>\n";
+        }
+    }
+
+    private function get_current_page_url() {
+        $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http';
+        return $protocol . "://" . $_SERVER['HTTP_HOST'] . $_SERVER['REQUEST_URI'];
+    }
+
+    private function get_page_html() {
+        ob_start();
+        wp_head();
+        wp_footer();
+        return ob_get_clean();
+    }
+
+    private function is_memory_exhausted($threshold = 0.85) {
+        $memory_limit = ini_get('memory_limit');
+        $memory_limit_bytes = $this->wp_convert_hr_to_bytes($memory_limit);
+        $current_usage = memory_get_usage(true);
+        
+        return ($current_usage / $memory_limit_bytes) > $threshold;
+    }
+
+    private function process_css_document($css_document) {
+        try {
+            // Convert CSS document to string
+            $css = $css_document->render();
+            
+            // Use autoprefixer
+            $autoprefixer = new \Padaliyajay\PHPAutoprefixer\Autoprefixer($css);
+            $css = $autoprefixer->compile();
+            
+            // Minify the result
+            return $this->minify_css($css);
+        } catch (Exception $e) {
+            error_log('CSS Optimizer Error in processing: ' . $e->getMessage());
+            return '';
+        }
+    }
+
+    private function wp_convert_hr_to_bytes($size) {
+        $size = trim($size);
+        $unit = strtolower(substr($size, -1));
+        $size = (int)$size;
+        
+        switch ($unit) {
+            case 'g':
+                $size *= 1024;
+            case 'm':
+                $size *= 1024;
+            case 'k':
+                $size *= 1024;
+        }
+        
+        return $size;
+    }
+
+    private function analyze_and_optimize_css($css, $html_content) {
+        // Limit the size of CSS to process
+        if (strlen($css) > 1000000) { // 1MB limit
+            error_log('CSS Optimizer: CSS file too large, skipping optimization');
+            return $css;
+        }
+
+        // Parse CSS into rules
+        preg_match_all('/([^{]+)\{([^}]+)\}/s', $css, $matches);
+        
+        $optimized = '';
+        if (!empty($matches[0])) {
+            // Process rules in smaller chunks
+            $chunk_size = 100; // Process 100 rules at a time
+            $total_rules = count($matches[0]);
+            
+            for ($i = 0; $i < $total_rules; $i += $chunk_size) {
+                $chunk = array_slice($matches[0], $i, $chunk_size);
+                $selectors_chunk = array_slice($matches[1], $i, $chunk_size);
+                $properties_chunk = array_slice($matches[2], $i, $chunk_size);
+                
+                foreach ($chunk as $j => $rule) {
+                    $selectors = $selectors_chunk[$j];
+                    $properties = $properties_chunk[$j];
+                    
+                    // Skip if it's a media query
+                    if (strpos($selectors, '@media') === 0) {
+                        if ($this->options['preserve_media_queries']) {
+                            $optimized .= $rule;
+                        }
+                        continue;
+                    }
+                    
+                    // Process selectors
+                    $selector_array = array_map('trim', explode(',', $selectors));
+                    $keep_rule = false;
+                    
+                    foreach ($selector_array as $selector) {
+                        if ($this->is_excluded_selector($selector) || 
+                            $this->is_selector_used($selector, $html_content)) {
+                            $keep_rule = true;
+                            break;
+                        }
+                    }
+                    
+                    if ($keep_rule) {
+                        $optimized .= trim($selectors) . '{' . $properties . '}';
+                    }
+                }
+                
+                // Clean up chunk memory
+                unset($chunk);
+                unset($selectors_chunk);
+                unset($properties_chunk);
+                if (function_exists('gc_collect_cycles')) {
+                    gc_collect_cycles();
+                }
+            }
+        }
+        
+        return $this->minify_css($optimized);
+    }
+
+    private function is_selector_used($selector, $html_content) {
         // Clean selector for testing
         $selector = trim($selector);
         
@@ -205,10 +273,8 @@ private function wp_convert_hr_to_bytes($size) {
             return true;
         }
     }
-  
-  
-  
-   private function is_excluded_selector($selector) {
+
+    private function is_excluded_selector($selector) {
         if (empty($this->options['excluded_classes'])) {
             return false;
         }
@@ -221,9 +287,8 @@ private function wp_convert_hr_to_bytes($size) {
         
         return false;
     }
-  
-  
-   private function filter_device_specific_css($css) {
+
+    private function filter_device_specific_css($css) {
         if ($this->is_mobile) {
             // Remove desktop-only media queries
             $css = preg_replace('/@media\s*\(\s*min-width\s*:.*?\{.*?\}/s', '', $css);
@@ -233,7 +298,6 @@ private function wp_convert_hr_to_bytes($size) {
         }
         return $css;
     }
-
 
     private function clean_php_warnings($css) {
         // Remove PHP warnings and notices
@@ -357,26 +421,6 @@ private function wp_convert_hr_to_bytes($size) {
 
         $response = wp_remote_get($url);
         return !is_wp_error($response) ? wp_remote_retrieve_body($response) : false;
-    }
-
-    private function process_and_enqueue_style($handle, $css_content, $wp_styles) {
-        // Special handling for theme custom styles
-        if (strpos($handle, 'custom-styles') !== false) {
-            $css_content = $this->clean_php_warnings($css_content);
-            wp_deregister_style($handle);
-            wp_register_style($handle . '-optimized', false);
-            wp_enqueue_style($handle . '-optimized');
-            wp_add_inline_style($handle . '-optimized', $css_content);
-            return;
-        }
-        
-        $optimized_css = $this->optimize_css($css_content);
-        $optimized_css = $this->fix_font_paths($optimized_css, dirname($wp_styles->registered[$handle]->src));
-
-        wp_deregister_style($handle);
-        wp_register_style($handle . '-optimized', false);
-        wp_enqueue_style($handle . '-optimized');
-        wp_add_inline_style($handle . '-optimized', $optimized_css);
     }
 
     private function optimize_css($css) {
